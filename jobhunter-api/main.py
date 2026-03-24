@@ -165,7 +165,88 @@ async def root():
         "supabase": "✅ connected" if SUPABASE_URL else "❌ not configured",
     }
 
+"""
+Temporary debug routes — add these to main.py to diagnose
+why Naukri and Foundit return 0 jobs.
 
+Paste these two routes into main.py just before the @app.get("/health") line,
+redeploy, then hit the debug URLs to see what's actually coming back.
+"""
+
+# ─── DEBUG routes (remove after diagnosis) ───────────────────────────────────
+
+@app.get("/debug/naukri-raw", tags=["Debug"])
+async def debug_naukri_raw(query: str = Query(default="Java Developer")):
+    """Returns raw Naukri API response so we can see what the server actually sends back."""
+    import urllib.parse
+    params = urllib.parse.urlencode({
+        "noOfResults": "5",
+        "urlType": "search_by_keyword",
+        "searchType": "adv",
+        "keyword": query,
+        "location": "india",
+        "pageNo": "1",
+        "src": "jobsearchDesk",
+        "xp": "1",
+    })
+    url = f"https://www.naukri.com/jobapi/v3/search?{params}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "appid": "109",
+        "systemid": "109",
+        "Referer": "https://www.naukri.com/",
+        "Origin": "https://www.naukri.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        # Warm session
+        try:
+            await client.get("https://www.naukri.com/", headers=headers, timeout=10)
+        except Exception:
+            pass
+        try:
+            resp = await client.get(url, headers=headers, timeout=15)
+            return {
+                "status_code": resp.status_code,
+                "headers": dict(resp.headers),
+                "body_preview": resp.text[:3000],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+
+@app.get("/debug/foundit-raw", tags=["Debug"])
+async def debug_foundit_raw(query: str = Query(default="Java Developer")):
+    """Returns raw Foundit HTML snippet so we can see if __NEXT_DATA__ is present."""
+    import re
+    params = {"query": query, "locations": "India", "sort": "1"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "Referer": "https://www.foundit.in/",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        try:
+            resp = await client.get("https://www.foundit.in/srp/results", params=params, headers=headers, timeout=15)
+            html = resp.text
+            has_next_data = "__NEXT_DATA__" in html
+            # Extract just the __NEXT_DATA__ block if present
+            match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+            next_data_preview = match.group(1)[:3000] if match else "NOT FOUND"
+            return {
+                "status_code": resp.status_code,
+                "url": str(resp.url),
+                "has_next_data": has_next_data,
+                "html_length": len(html),
+                "next_data_preview": next_data_preview,
+            }
+        except Exception as e:
+            return {"error": str(e)}
 @app.get("/health", tags=["Info"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
