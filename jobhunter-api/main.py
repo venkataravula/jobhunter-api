@@ -20,6 +20,8 @@ SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
 CRON_SECRET    = os.getenv("CRON_SECRET", "")  # same secret as Lambda
 
 from scrapers.indeed_india import fetch_indeed_india_bulk, search_indeed_india
+from scrapers.naukri import fetch_naukri_bulk
+from scrapers.foundit import fetch_foundit_bulk
 from scrapers.adzuna import search_adzuna
 from scrapers.remotive import search_remotive
 from scrapers.themuse import search_themuse
@@ -229,6 +231,98 @@ async def preview_indeed_india(
         "fetched_at": datetime.utcnow().isoformat(),
     }
 
+
+
+# ─── India Portals (Naukri + Foundit) ────────────────────────────────────────
+
+@app.post("/jobs/india-portals/fetch", tags=["India Jobs"])
+async def fetch_and_save_india_portals(
+    queries: List[str] = Query(..., description="Job title keywords"),
+    secret: str = Query(..., description="Cron secret"),
+    limit_per_query: int = Query(20, ge=1, le=50),
+):
+    """
+    🇮🇳 Scrape Naukri + Foundit and save to Supabase.
+    Called by Lambda at end of each run — not browser-facing.
+
+    Example (from Lambda):
+      POST /jobs/india-portals/fetch
+           ?queries=Data+Analyst&queries=Java+Developer
+           &secret=cron_9f8a7d6c5b4a3e2f1
+    """
+    if not CRON_SECRET or secret != CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    date_iso = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Run Naukri and Foundit concurrently
+    naukri_jobs, foundit_jobs = await asyncio.gather(
+        fetch_naukri_bulk(queries, limit_per_query),
+        fetch_foundit_bulk(queries, limit_per_query),
+        return_exceptions=True,
+    )
+
+    if isinstance(naukri_jobs, Exception):
+        print(f"[india-portals] Naukri error: {naukri_jobs}")
+        naukri_jobs = []
+    if isinstance(foundit_jobs, Exception):
+        print(f"[india-portals] Foundit error: {foundit_jobs}")
+        foundit_jobs = []
+
+    all_jobs = list(naukri_jobs) + list(foundit_jobs)
+
+    # Deduplicate by URL
+    seen: set = set()
+    deduped = []
+    for job in all_jobs:
+        if job.url and job.url not in seen:
+            seen.add(job.url)
+            deduped.append(job)
+
+    async with httpx.AsyncClient() as client:
+        batch_id = await _get_or_create_batch(client, date_iso)
+        if not batch_id:
+            raise HTTPException(status_code=500, detail="Could not get/create today's batch")
+        saved = await _save_jobs(client, deduped, batch_id)
+        if saved > 0:
+            await _sb_patch(client, f"job_batches?id=eq.{batch_id}", {"status": "published"})
+
+    return {
+        "date": date_iso,
+        "batch_id": batch_id,
+        "queries_run": len(queries),
+        "naukri_found": len(naukri_jobs),
+        "foundit_found": len(foundit_jobs),
+        "total_found": len(deduped),
+        "saved_to_supabase": saved,
+        "batch_status": "published" if saved > 0 else "draft (no new jobs)",
+    }
+
+
+@app.get("/jobs/india-portals/preview", tags=["India Jobs"])
+async def preview_india_portals(
+    query: str = Query(...),
+    source: str = Query("naukri", description="naukri or foundit"),
+    limit: int = Query(10, ge=1, le=25),
+):
+    """🔍 Preview Naukri/Foundit results without writing to Supabase."""
+    if source == "foundit":
+        from scrapers.foundit import search_foundit
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            jobs = await search_foundit(client, query, limit)
+    else:
+        from scrapers.naukri import search_naukri, _warm_session
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            await _warm_session(client)
+            jobs = await search_naukri(client, query, limit)
+    return {
+        "query": query, "source": source, "location": "India",
+        "total": len(jobs),
+        "jobs": [j.dict() for j in jobs],
+        "fetched_at": datetime.utcnow().isoformat(),
+    }
 
 # ─── Existing endpoints (India defaults) ─────────────────────────────────────
 
